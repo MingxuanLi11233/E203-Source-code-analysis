@@ -156,3 +156,133 @@ E203的分支预测单元在每个周期根据当前的PC值与指令的简单�
 - jalr rn
   - prdt_pc_add_op1：寄存器堆访问结果：rf2bpu_rs1
   - prdt_pc_add_op2：bjp_imm
+### 1.4 各功能部件整合：e203_ifu_ifetch.v
+e203的取指单元主要分为两部分，e203_ifu_ifetch实现了PC，IR寄存器，并将其和之前叙述的minidec与litebpu结合起来，组成了取指控制电路；而另一部分即e203_ifu_ift2icb则专门负责管理对指令存储器的访问。下图描述了e203_ifu_ifetch相关的模块例化关系。
+<div align=center>
+<img src="images/e203_ifu_codes.png" width = "500" height = "280"/>
+</div>
+
+e203_ifu_ifetch.v模块的输入输出接口主要根据大体功能可以分为以下几类
+- 向指令存储器发送的信号（output）
+  - ifu_req_pc：
+  - ifu_req_last_pc：
+  - ifu_req_seq：
+  - ifu_req_seq_rv32：
+  - ifu_req_valid
+  - ifu_rsp_ready
+- 指令存储器访问结果以及指令存储器的状态（input）
+  - ifu_rsp_instr
+  - ifu_rsp_err
+  - ifu_rsp_valid
+  - ifu_req_ready
+- ifu单元的输出（用于ex阶段或者进行相关控制）（output）
+  - ifu_o_ir
+  - ifu_o_buserr
+  - ifu_o_valid
+  - ifu_o_pc
+  - ifu_o_pc_vld
+  - ifu_o_rs1idx
+  - ifu_o_rs2idx
+  - ifu_o_prdt_taken
+  - ifu_o_misalgn
+  - ifu_o_muldiv_b2b
+  - ifu_o_valid
+  - inspect_pc
+- 执行单元传回的信号（input）
+  - ifu_o_ready
+  - oitf_empty
+  - rf2ifu_x1
+  - rf2ifu_rs1
+  - dec2ifu_rs1en
+  - dec2ifu_rden
+  - dec2ifu_rdidx
+  - dec2ifu_mulhsu
+  - dec2ifu_div
+  - dec2ifu_rem
+  - dec2ifu_divu
+  - dec2ifu_remu
+- 用于冲刷流水线的相关信号
+  - pipe_flush_req
+  - pipe_flush_pc
+  - pipe_flush_add_op1
+  - pipe_flush_add_op2
+- halt信号
+  - ifu_halt_req
+  - ifu_halt_ack
+- 时钟与复位
+  - clk
+  - rst_n
+- 其他信号
+  - pc_rtvec
+  - pipe_flush_ack
+##### 1.4.1 总体微架构设计
+ifetch部分的总体微架构设计如图所示
+<div align=center>
+<img src="images/ifetch_micro_self.png" width = "590" height = "450"/>
+</div>
+
+##### 1.4.2 取指
+1. **提前取指**
+在取指阶段，一般是根据PC中的值，访问指令存储器得到指令。而在E203中，实际上对指令存储器的访问在PC设置为新值之前就已经开始了。基本的设计如下  
+新的PC值由PC生成电路生成，在PC寄存器pc_dfflr被设置为该值之前，这个新的PC值已经被用于访问指令存储器，并将访存结果存储在指令寄存器访问单元的一个特殊的时序逻辑电路中（根据注释，这一时序逻辑有特殊的功能，目前可以简单看做寄存器）；当新的PC值被设定时，这一提前提取出的指令就被设置为指令存储器控制模块的输出，此时的效果就是：从控制模块返回的指令信号恰好就是当前PC所指示的指令。
+<div align=center>
+<img src="images/instruction_fetch.png" width = "540" height = "550"/>
+</div>
+
+2. **取指输出接口**
+以下列出e203_ifu_ifetch模块的输出信号，这些信号来源于当前的PC值、微型译码器的译码结果、以及BPU的预测结果，用于访问指令存储器
+- ifu_req_pc：取指令所用的PC值
+- ifu_req_last_pc：上一次进行取值的PC值（即当前PC中的值）
+- ifu_req_seq：根据当前PC中的值，按顺序取下一条指令（无跳转，无流水线冲刷，无reset）
+- ifu_req_seq_rv32：表示当前指令为32位，如果此次取指为顺序取指，该信号给出用于下次取指的PC的自增量
+- ifu_req_valid：ifetch发出了有效的取指令请求
+- ifu_rsp_ready：IR准备好接受下一条指令
+3. **取指令输入接口**
+取指返回结果，以及一些状态信息
+- ifu_req_ready：访存部件准备好接受下一次访存请求
+- ifu_rsp_valid：访存部件返回的指令有效
+- ifu_rsp_err：访存发生错误
+- ifu_rsp_instr：返回的指令
+##### 1.4.3 解码与分支预测
+1. 在e203_ifu_ifetch模块中，例化了一个decode模块和一个BPU模块，其中decode模块根据需求只例化了一部分，将不需要的端口悬空。
+2. 从指令存储器访问控制模块中输出的指令，经过上述简单decode模块解码，给出指令的基本信息，这些信息进一步用做BPU的输入，作为其预测下一个PC值的依据
+3. 译码器与BPU均为逻辑电路
+##### 1.4.4 IF/EX流水线寄存器输出
+在IF阶段给出的信号，如果要在EX阶段使用，需要将其设置到IF/EX之间的流水线寄存器中。流水线寄存器在e203_ifu_ifetch中实现，其内容通过模块的输出端口输出到EX模块中。主要输出端口如下
+- ifu_o_ir：IR，为当前传入EX的指令
+- ifu_o_buserr：说明取指时访问指令存储器时发生了错误
+- ifu_o_valid：IR中的指令是否有效
+- ifu_o_rs1idx：寄存器堆端口1的目标寄存器
+- ifu_o_rs2idx：寄存器堆端口2的目标寄存器
+- ifu_o_prdt_taken：分支预测是否为taken（bxx指令）
+- ifu_o_muldiv_b2b：是否为乘除指令
+- ifu_o_misalgn：默认为1'b0（在RV32C中不会发生）
+- ifu_o_pc：指令的PC值
+- ifu_o_pc_vld：指令的PC值是否有效
+##### 1.4.5 握手机制（此处暂不考虑流水线冲刷问题）
+时序控制是处理器设计中一个十分重要的部分，关系到设计能否按照需求运行而不会出现时序错误。要理清E203的时序设计，需要将注意力集中在各个时序部件上，也就是寄存器，分析其数据传送关系以及寄存器值更新的条件。   
+为了保证数据的安全性，E203采用模块间的握手通信。
+1. E203中的时序电路
+E203中的时序电路主要包含以下几个部分：1）存储指令地址的PC. 2）存储指令的u_e203_ifetch_rsp_bypbuf. 3）IF与EX之间的流水线寄存器，主要为PC、IR，也包含其他指令信息字段
+<div align=center>
+<img src="images/instruction_fetch.png" width = "540" height = "550"/>
+</div>
+
+2. 将E203中主要时序部件提取出来，按照关系整理为下图
+<div align=center>
+<img src="images/timing_control.png" width = "760" height = "420"/>
+</div>
+
+从图中可见，总共有两组流水线寄存器，分别是PC和IF/EX；与之对应，有三组握手信号，分别对应：取指，设置IR，指令执行。   
+相应控制信号关系如下
+- 执行阶段握手信号：**ifu_ir_o_hsked** = (ifu_o_valid & ifu_o_ready). 当该信号被拉高时，表明IR中的指令有效并且已经执行完成，准备好接受下一条指令
+- 流水线寄存器使能信号：**ir_valid_set** = ifu_rsp_hsked （PC与IF/EX握手成功才设置流水线寄存器）
+- IF/EX准备好接受新指令的条件判断：**ifu_rsp_ready** = ifu_rsp2ir_ready = ifu_ir_i_ready & ifu_req_ready 其中
+    - **ifu_ir_i_ready**   = (~ir_valid_r) | ir_valid_clr 其中
+      - ir_valid_r 为流水线寄存器 ir_valid_dfflr 的输出，表示当前指令是否有效
+      - ir_valid_clr = ifu_ir_o_hsked 也就是说指令执行有效但是已经执行完成
+      也就是说，当IR中是**无效指令**或者已经**执行完成**时，IR才准备好接受下一条指令
+    - ifu_req_ready：
+- PC使能信号：**ir_pc_vld_set** = pc_newpend_r & ifu_ir_i_ready
+  - pc_newpend_r
+  - ifu_ir_i_ready
